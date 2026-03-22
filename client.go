@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 const defaultBaseURL = "https://worker.gradual.so/api/v1"
@@ -23,6 +27,7 @@ type Options struct {
 	EventsEnabled     bool
 	EventsFlushMs     int
 	EventsMaxBatch    int
+	RealtimeEnabled   bool
 }
 
 // Client is a feature flag client that connects to the Gradual edge service.
@@ -48,6 +53,12 @@ type Client struct {
 	eventsFlushMs  int
 	eventsMaxBatch int
 
+	realtimeEnabled bool
+	wsConn          *websocket.Conn
+	wsMu            sync.Mutex
+	stopWS          chan struct{}
+	wsCancel        context.CancelFunc
+
 	updateListeners []func()
 	listenersMu     sync.Mutex
 }
@@ -63,6 +74,19 @@ func NewClient(ctx context.Context, opts Options) *Client {
 		pollingInterval = 10 * time.Second
 	}
 
+	realtimeEnabled := opts.RealtimeEnabled
+	// Default to true if not explicitly set. Since Go zero-value for bool is
+	// false, we treat the zero-value Options (where PollingEnabled is also
+	// false) as "realtime enabled by default". Users who want to disable
+	// realtime should set RealtimeEnabled = false explicitly. We detect
+	// the "unset" case by checking if neither polling nor realtime were
+	// explicitly enabled — in that case we default realtime on.
+	// However, the simplest convention matching the TS SDK: default true.
+	// We use a helper: if the user hasn't set any transport preference, enable realtime.
+	if !opts.PollingEnabled && !opts.RealtimeEnabled {
+		realtimeEnabled = true
+	}
+
 	c := &Client{
 		apiKey:          opts.APIKey,
 		environment:     opts.Environment,
@@ -75,6 +99,8 @@ func NewClient(ctx context.Context, opts Options) *Client {
 		eventsFlushMs:   opts.EventsFlushMs,
 		eventsMaxBatch:  opts.EventsMaxBatch,
 		stopPolling:     make(chan struct{}),
+		realtimeEnabled: realtimeEnabled,
+		stopWS:          make(chan struct{}),
 	}
 
 	go c.init(ctx)
@@ -115,15 +141,26 @@ func (c *Client) init(ctx context.Context) {
 		return
 	}
 
-	// Fetch initial snapshot
-	if err := c.fetchSnapshot(ctx); err != nil {
-		c.initErr = fmt.Errorf("gradual: snapshot fetch failed: %w", err)
-		return
+	// Try WebSocket for initial snapshot + real-time updates
+	wsConnected := false
+	if c.realtimeEnabled {
+		if err := c.connectWebSocket(ctx); err == nil {
+			wsConnected = true
+		}
+		// If WebSocket fails, fall through to HTTP fetch + polling
 	}
 
-	// Start polling
-	if c.pollingEnabled {
-		go c.poll(ctx)
+	if !wsConnected {
+		// Fetch initial snapshot via HTTP
+		if err := c.fetchSnapshot(ctx); err != nil {
+			c.initErr = fmt.Errorf("gradual: snapshot fetch failed: %w", err)
+			return
+		}
+
+		// Start polling
+		if c.pollingEnabled {
+			go c.poll(ctx)
+		}
 	}
 
 	// Initialize event buffer
@@ -231,11 +268,7 @@ func (c *Client) poll(ctx context.Context) {
 			c.mu.RUnlock()
 
 			if newVersion != prevVersion {
-				c.listenersMu.Lock()
-				for _, cb := range c.updateListeners {
-					cb()
-				}
-				c.listenersMu.Unlock()
+				c.notifyListeners()
 			}
 		}
 	}
@@ -347,11 +380,209 @@ func (c *Client) OnUpdate(callback func()) func() {
 	}
 }
 
-// Close stops polling and flushes pending events.
+// Close stops polling, closes WebSocket, and flushes pending events.
 func (c *Client) Close() {
 	close(c.stopPolling)
+
+	// Close WebSocket
+	select {
+	case <-c.stopWS:
+		// already closed
+	default:
+		close(c.stopWS)
+	}
+	if c.wsCancel != nil {
+		c.wsCancel()
+	}
+	c.wsMu.Lock()
+	if c.wsConn != nil {
+		c.wsConn.CloseNow()
+		c.wsConn = nil
+	}
+	c.wsMu.Unlock()
+
 	if c.eventBuffer != nil {
 		c.eventBuffer.Destroy()
+	}
+}
+
+// wsURL builds the WebSocket URL from the base URL.
+func (c *Client) wsURL() string {
+	u := c.baseURL
+	u = strings.Replace(u, "https://", "wss://", 1)
+	u = strings.Replace(u, "http://", "ws://", 1)
+
+	params := url.Values{}
+	params.Set("apiKey", c.apiKey)
+	params.Set("environment", c.environment)
+
+	return u + "/sdk/connect?" + params.Encode()
+}
+
+// connectWebSocket dials the WebSocket and reads the first message as the initial snapshot.
+// On success it starts a goroutine to listen for subsequent updates.
+func (c *Client) connectWebSocket(ctx context.Context) error {
+	wsCtx, cancel := context.WithCancel(context.Background())
+	c.wsCancel = cancel
+
+	conn, _, err := websocket.Dial(ctx, c.wsURL(), nil)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("gradual: websocket dial failed: %w", err)
+	}
+
+	// Read the first message — initial snapshot
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		conn.CloseNow()
+		cancel()
+		return fmt.Errorf("gradual: websocket initial read failed: %w", err)
+	}
+
+	var snap EnvironmentSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		conn.CloseNow()
+		cancel()
+		return fmt.Errorf("gradual: websocket snapshot parse failed: %w", err)
+	}
+
+	c.mu.Lock()
+	c.snapshot = &snap
+	c.mu.Unlock()
+
+	c.wsMu.Lock()
+	c.wsConn = conn
+	c.wsMu.Unlock()
+
+	// Start listening for updates
+	go c.wsListen(wsCtx, conn)
+
+	return nil
+}
+
+// wsListen reads messages from the WebSocket and updates the snapshot.
+// On disconnect it schedules a reconnect with exponential backoff.
+func (c *Client) wsListen(ctx context.Context, conn *websocket.Conn) {
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			// Check if we've been told to stop
+			select {
+			case <-c.stopWS:
+				return
+			default:
+			}
+
+			// Connection error — close and reconnect
+			conn.CloseNow()
+			c.wsMu.Lock()
+			c.wsConn = nil
+			c.wsMu.Unlock()
+
+			go c.wsReconnect(ctx)
+			return
+		}
+
+		var snap EnvironmentSnapshot
+		if err := json.Unmarshal(data, &snap); err != nil {
+			continue
+		}
+
+		c.mu.RLock()
+		prevVersion := 0
+		if c.snapshot != nil {
+			prevVersion = c.snapshot.Version
+		}
+		c.mu.RUnlock()
+
+		c.mu.Lock()
+		c.snapshot = &snap
+		c.mu.Unlock()
+
+		if snap.Version != prevVersion {
+			c.notifyListeners()
+		}
+	}
+}
+
+// wsReconnect attempts to reconnect the WebSocket with exponential backoff.
+func (c *Client) wsReconnect(ctx context.Context) {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-c.stopWS:
+			return
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		conn, _, err := websocket.Dial(ctx, c.wsURL(), nil)
+		if err != nil {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Read first message as snapshot
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			conn.CloseNow()
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		var snap EnvironmentSnapshot
+		if err := json.Unmarshal(data, &snap); err != nil {
+			conn.CloseNow()
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		c.mu.RLock()
+		prevVersion := 0
+		if c.snapshot != nil {
+			prevVersion = c.snapshot.Version
+		}
+		c.mu.RUnlock()
+
+		c.mu.Lock()
+		c.snapshot = &snap
+		c.mu.Unlock()
+
+		c.wsMu.Lock()
+		c.wsConn = conn
+		c.wsMu.Unlock()
+
+		if snap.Version != prevVersion {
+			c.notifyListeners()
+		}
+
+		// Resume listening
+		go c.wsListen(ctx, conn)
+		return
+	}
+}
+
+// notifyListeners calls all registered update callbacks.
+func (c *Client) notifyListeners() {
+	c.listenersMu.Lock()
+	listeners := make([]func(), len(c.updateListeners))
+	copy(listeners, c.updateListeners)
+	c.listenersMu.Unlock()
+
+	for _, cb := range listeners {
+		cb()
 	}
 }
 
